@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../test-scenario/rfi_subspace_extraction_types.hpp"
+#include "rfi_subspace_extraction_types.hpp"
 #include <cstddef>
 
 namespace rfi_starpu {

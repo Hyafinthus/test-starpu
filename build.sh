@@ -7,10 +7,24 @@ STARPU_PKG="${STARPU_PKG:-starpu-1.4}"
 CUDA_ARCH="${CUDA_ARCH:-75}" # CUDA 10.1 PTX; A6000 uses driver JIT.
 NVCC_BIN="${NVCC:-nvcc}"
 CXX_BIN="${CXX:-g++}"
+
+parse_flags() {
+  local words word
+  words="$(python3 -c 'import shlex, sys; print("\n".join(shlex.split(sys.argv[1])))' "$1")"
+  PARSED_FLAGS=()
+  if [[ -n "$words" ]]; then
+    while IFS= read -r word; do
+      PARSED_FLAGS+=("$word")
+    done <<< "$words"
+  fi
+}
+
 STARPU_CFLAGS_TEXT="$(pkg-config --cflags "$STARPU_PKG")"
 STARPU_LIBS_TEXT="$(pkg-config --libs "$STARPU_PKG")"
-read -r -a STARPU_CFLAGS <<< "$STARPU_CFLAGS_TEXT"
-read -r -a STARPU_LIBS <<< "$STARPU_LIBS_TEXT"
+parse_flags "$STARPU_CFLAGS_TEXT"
+STARPU_CFLAGS=("${PARSED_FLAGS[@]}")
+parse_flags "$STARPU_LIBS_TEXT"
+STARPU_LIBS=("${PARSED_FLAGS[@]}")
 NVCC_CFLAGS=()
 for flag in "${STARPU_CFLAGS[@]}"; do
   case "$flag" in
@@ -28,7 +42,8 @@ for flag in "${STARPU_LIBS[@]}"; do
 done
 EXTRA_FLAGS=()
 if [[ -n "${NVCC_EXTRA_FLAGS:-}" ]]; then
-  read -r -a EXTRA_FLAGS <<< "$NVCC_EXTRA_FLAGS"
+  parse_flags "$NVCC_EXTRA_FLAGS"
+  EXTRA_FLAGS=("${PARSED_FLAGS[@]}")
 fi
 mkdir -p "$BUILD_DIR"
 

@@ -1,7 +1,7 @@
 #pragma once
 #include <starpu.h>
 #include "rfi_codelets.hpp"
-#include "../test-scenario/rfi_subspace_extraction_common.hpp"
+#include "rfi_subspace_extraction_common.hpp"
 #include <memory>
 
 namespace rfi_starpu {
