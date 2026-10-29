@@ -53,6 +53,8 @@ echo "Building with $STARPU_PKG $(pkg-config --modversion "$STARPU_PKG"), C++14,
   -o "$BUILD_DIR/rfi_subspace_extraction_starpu.o"
 "$CXX_BIN" -O3 -DNDEBUG -std=c++14 "${STARPU_CFLAGS[@]}" \
   -c "$SCRIPT_DIR/rfi_tasks.cpp" -o "$BUILD_DIR/rfi_tasks.o"
+"$CXX_BIN" -O3 -DNDEBUG -std=c++14 "${STARPU_CFLAGS[@]}" \
+  -c "$SCRIPT_DIR/rfi_metrics.cpp" -o "$BUILD_DIR/rfi_metrics.o"
 
 "$NVCC_BIN" -O3 -DNDEBUG -std=c++14 --expt-relaxed-constexpr \
   -ccbin "$CXX_BIN" \
@@ -63,7 +65,7 @@ echo "Building with $STARPU_PKG $(pkg-config --modversion "$STARPU_PKG"), C++14,
 
 "$NVCC_BIN" -ccbin "$CXX_BIN" --cudart shared \
   "$BUILD_DIR/rfi_subspace_extraction_starpu.o" \
-  "$BUILD_DIR/rfi_tasks.o" "$BUILD_DIR/rfi_cuda.o" \
+  "$BUILD_DIR/rfi_tasks.o" "$BUILD_DIR/rfi_metrics.o" "$BUILD_DIR/rfi_cuda.o" \
   -o "$BUILD_DIR/rfi_subspace_extraction_starpu" \
   "${NVCC_LIBS[@]}"
 echo "built: $BUILD_DIR/rfi_subspace_extraction_starpu"

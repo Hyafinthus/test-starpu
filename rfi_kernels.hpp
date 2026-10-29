@@ -70,7 +70,7 @@ __device__ inline void row_correlation_item(
   const auto snapshots = args.snapshots;
   const auto correlation_lags = args.correlation_lags;
   const auto folded = args.folded;
-  const std::size_t work_row = item[0];
+  const std::size_t work_row = args.row_begin + item[0];
   const std::size_t antenna0 =
       folded ? ((work_row & 1U) == 0U
                     ? work_row / 2
@@ -78,8 +78,8 @@ __device__ inline void row_correlation_item(
              : work_row;
   for (std::size_t antenna1 = 0; antenna1 < antennas; ++antenna1) {
     if (antenna1 < antenna0) {
-      basis[{work_row, antenna1}] = 0.0f;
-      correlation_snapshot[{work_row, antenna1}] = 0.0f;
+      basis[{item[0], antenna1}] = 0.0f;
+      correlation_snapshot[{item[0], antenna1}] = 0.0f;
       continue;
     }
     float correlation_energy = 0.0f;
@@ -102,8 +102,8 @@ __device__ inline void row_correlation_item(
     if (antenna1 == antenna0) {
       correlation += 0.25f;
     }
-    basis[{work_row, antenna1}] = correlation;
-    correlation_snapshot[{work_row, antenna1}] = correlation;
+    basis[{item[0], antenna1}] = correlation;
+    correlation_snapshot[{item[0], antenna1}] = correlation;
   }
 }
 
@@ -114,7 +114,7 @@ __device__ inline void pair_correlation_item(
   const auto snapshots = args.snapshots;
   const auto correlation_lags = args.correlation_lags;
   const auto folded = args.folded;
-  const std::size_t work_row = item[0];
+  const std::size_t work_row = args.row_begin + item[0];
   const std::size_t antenna1 = item[1];
   const std::size_t antenna0 =
       folded ? ((work_row & 1U) == 0U

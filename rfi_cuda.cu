@@ -27,7 +27,7 @@ struct CudaTeam {
 void check_launch() {
   const auto error = cudaGetLastError();
   if (error != cudaSuccess) STARPU_CUDA_REPORT_ERROR(error);
-  record_cuda_task();
+  record_cuda_kernel();
 }
 
 __global__ void mean_kernel(Matrix data, float* mean, KernelArgs args) {
@@ -79,7 +79,7 @@ void normalize_cuda(void* buffers[], void* cl_arg) {
 }
 
 __global__ void row_correlation_kernel(Matrix data, const std::uint32_t* lag_offsets, Matrix basis, Matrix correlation_snapshot, KernelArgs args) {
-  const std::size_t count = args.antennas;
+  const std::size_t count = args.row_count;
   for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
        i < count; i += std::size_t(blockDim.x) * gridDim.x) {
     row_correlation_item(data, lag_offsets, basis, correlation_snapshot, args, Index{i});
@@ -89,13 +89,13 @@ __global__ void row_correlation_kernel(Matrix data, const std::uint32_t* lag_off
 void row_correlation_cuda(void* buffers[], void* cl_arg) {
   KernelArgs args;
   starpu_codelet_unpack_args(cl_arg, &args);
-  row_correlation_kernel<<<blocks(args.antennas), block_threads, 0, starpu_cuda_get_local_stream()>>>(
+  row_correlation_kernel<<<blocks(args.row_count), block_threads, 0, starpu_cuda_get_local_stream()>>>(
       matrix(buffers[0]), vector<std::uint32_t>(buffers[1]), matrix(buffers[2]), matrix(buffers[3]), args);
   check_launch();
 }
 
 __global__ void pair_correlation_kernel(Matrix data, const std::uint32_t* lag_offsets, Matrix basis, Matrix correlation_snapshot, KernelArgs args) {
-  const std::size_t count = args.antennas * args.antennas;
+  const std::size_t count = args.row_count * args.antennas;
   for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
        i < count; i += std::size_t(blockDim.x) * gridDim.x) {
     pair_correlation_item(data, lag_offsets, basis, correlation_snapshot, args, Index{i / args.antennas, i % args.antennas});
@@ -105,7 +105,7 @@ __global__ void pair_correlation_kernel(Matrix data, const std::uint32_t* lag_of
 void pair_correlation_cuda(void* buffers[], void* cl_arg) {
   KernelArgs args;
   starpu_codelet_unpack_args(cl_arg, &args);
-  pair_correlation_kernel<<<blocks(args.antennas * args.antennas), block_threads, 0, starpu_cuda_get_local_stream()>>>(
+  pair_correlation_kernel<<<blocks(args.row_count * args.antennas), block_threads, 0, starpu_cuda_get_local_stream()>>>(
       matrix(buffers[0]), vector<std::uint32_t>(buffers[1]), matrix(buffers[2]), matrix(buffers[3]), args);
   check_launch();
 }
@@ -195,6 +195,66 @@ void final_summary_cuda(void* buffers[], void* cl_arg) {
   check_launch();
 }
 
+// Buffer order: data, mean, stddev, basis, snapshot, lags, rows, summary, norm.
+// All launches share StarPU's stream; the asynchronous codelet completes after
+// its final kernel. The numerical kernels are identical to the Stage variant.
+void tile_cuda(void* buffers[], void* cl_arg) {
+  KernelArgs args;
+  starpu_codelet_unpack_args(cl_arg, &args);
+  const auto stream = starpu_cuda_get_local_stream();
+  const auto data = matrix(buffers[0]);
+  const auto basis = matrix(buffers[3]);
+  const auto snapshot = matrix(buffers[4]);
+  auto mean = vector<float>(buffers[1]);
+  auto stddev = vector<float>(buffers[2]);
+  auto lags = vector<std::uint32_t>(buffers[5]);
+  auto rows = vector<rfi::CorrelationRowSummary>(buffers[6]);
+  auto norm = vector<float>(buffers[8]);
+  if (args.has_correlation) {
+    mean_kernel<<<blocks(args.antennas), block_threads, 0, stream>>>(data, mean, args);
+    check_launch();
+    stddev_kernel<<<blocks(args.antennas), block_threads, 0, stream>>>(data, mean, stddev, args);
+    check_launch();
+    normalize_kernel<<<blocks(args.antennas * args.snapshots), block_threads, 0, stream>>>(data, mean, stddev, args);
+    check_launch();
+    if (args.pair_parallel) {
+      pair_correlation_kernel<<<blocks(args.antennas * args.antennas), block_threads, 0, stream>>>(data, lags, basis, snapshot, args);
+    } else {
+      row_correlation_kernel<<<blocks(args.antennas), block_threads, 0, stream>>>(data, lags, basis, snapshot, args);
+    }
+    check_launch();
+    correlation_summary_kernel<<<blocks(args.antennas), block_threads, 0, stream>>>(snapshot, rows, args);
+    check_launch();
+  }
+  if (args.check_orthogonality) {
+    for (std::size_t pass = 0; pass < args.mgs_passes; ++pass) {
+      std::size_t end = args.rank;
+      while (end > 0) {
+        const auto width = args.classic ? std::size_t(1) : args.panel_size;
+        const auto begin = end > width ? end - width : 0;
+        args.panel_begin = begin;
+        args.panel_end = end;
+        if (args.classic) {
+          reverse_norm_kernel<<<1, 1, 0, stream>>>(basis, norm, args);
+          check_launch();
+          reverse_normalize_kernel<<<blocks(args.antennas), block_threads, 0, stream>>>(basis, norm, args);
+        } else {
+          reverse_panel_kernel<<<1, panel_threads, 0, stream>>>(basis, args);
+        }
+        check_launch();
+        if (begin > 0) {
+          args.execution_rows = args.compact ? begin : args.rank;
+          reverse_update_kernel<<<blocks(args.execution_rows), block_threads, 0, stream>>>(basis, args);
+          check_launch();
+        }
+        end = begin;
+      }
+    }
+  }
+  final_summary_kernel<<<1, 1, 0, stream>>>(basis, rows, vector<rfi::TileSummary>(buffers[7]), args);
+  check_launch();
+}
+
 } // namespace
 
 CudaFunction cuda_function(Stage stage) {
@@ -210,6 +270,7 @@ CudaFunction cuda_function(Stage stage) {
       reverse_panel_cuda,
       reverse_update_cuda,
       final_summary_cuda,
+      tile_cuda,
   };
   static_assert(sizeof(functions) / sizeof(functions[0]) ==
                 static_cast<std::size_t>(Stage::Count), "CUDA codelet count");

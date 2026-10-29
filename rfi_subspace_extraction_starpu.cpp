@@ -20,7 +20,7 @@ public:
     conf.ncpus = 0;
     conf.nopencl = 0;
     conf.nhip = 0;
-    if (!std::getenv("STARPU_SCHED")) conf.sched_policy_name = "lws";
+    sp::configure_scheduler(conf);
     sp::check_starpu(starpu_init(&conf), "initialize StarPU");
     const auto workers = starpu_worker_get_count_by_type(STARPU_CUDA_WORKER);
     if (workers == 0) {
@@ -28,8 +28,8 @@ public:
       throw std::runtime_error("no CUDA workers");
     }
     std::cout << "RUNTIME backend=cuda cuda_workers=" << workers
-              << " task_granularity=whole_tile_stage"
-              << " cuda_async=1 cpu_codelets=0 performance_models=0\n";
+              << " scheduler=" << starpu_sched_get_sched_policy()->policy_name
+              << " cuda_async=1 cpu_codelets=0 performance_models=history\n";
   }
   ~StarpuRuntime() {
     starpu_task_wait_for_all();
@@ -45,7 +45,7 @@ int main(int argc, char **argv) {
     const rfi::Config config =
         rfi::parse_config(argc, argv, /*celerity_options=*/false);
     sp::validate_starpu_config(config);
-    rfi::print_configuration(config, "starpu", "whole_tile");
+    rfi::print_configuration(config, "starpu", config.granularity.c_str());
 
     const auto total_begin = clock_type::now();
     StarpuRuntime runtime;
@@ -65,19 +65,22 @@ int main(int argc, char **argv) {
     const auto data_init_end = clock_type::now();
 
     rfi::Manifest manifest(config);
+    sp::begin_measurement();
     const auto run_begin = clock_type::now();
     sp::submit_batch(tiles, config, manifest);
     sp::check_starpu(starpu_task_wait_for_all(), "wait for batch");
     const auto run_end = clock_type::now();
+    sp::end_execution();
 
     if (manifest.submitted() !=
-        rfi::kernels_per_tile(config) * tile_count) {
-      throw std::runtime_error("submitted kernel count does not match metadata");
+        sp::expected_tasks(config)) {
+      throw std::runtime_error("submitted task count does not match metadata");
     }
 
     const auto result_begin = clock_type::now();
     const rfi::VerificationResult result = sp::read_results(tiles, config);
     const auto result_end = clock_type::now();
+    sp::end_measurement();
 
     std::cout << std::fixed << std::setprecision(6)
               << "TIMING runtime_init_sec="
@@ -88,6 +91,8 @@ int main(int argc, char **argv) {
               << '\n'
               << "TIMING result_sec="
               << seconds_between(result_begin, result_end) << '\n'
+              << "TIMING e2e_sec="
+              << seconds_between(run_begin, result_end) << '\n'
               << "TIMING total_sec="
               << seconds_between(total_begin, result_end) << '\n'
               << "RESULT correlation_checksum="
@@ -108,7 +113,10 @@ int main(int argc, char **argv) {
               << " basis_nonfinite=" << result.basis_nonfinite << '\n'
               << "VERIFY passed=" << (result.passed ? 1 : 0)
               << " full=" << (config.verify_full ? 1 : 0) << '\n';
-    sp::print_worker_stats();
+    sp::write_metrics(config, seconds_between(total_begin, runtime_init_end),
+        seconds_between(runtime_init_end, data_init_end),
+        seconds_between(run_begin, run_end), seconds_between(result_begin, result_end),
+        seconds_between(run_begin, result_end), seconds_between(total_begin, result_end));
     return (config.verify || config.verify_full) && !result.passed ? 2 : 0;
   } catch (const std::exception &exception) {
     std::cerr << "ERROR " << exception.what() << '\n';

@@ -28,14 +28,17 @@ enum class GsLayout { RowVectors, ColumnVectors };
 enum class GsKernelStructure { Blocked, Classic };
 
 struct Config {
-  std::size_t antennas = 768;
+  std::string granularity = "stage";
+  std::size_t partitions = 4;
+  std::string metrics_prefix = "rfi";
+  std::size_t antennas = 4096;
   std::size_t snapshots = 2048;
-  std::size_t bands = 8;
+  std::size_t bands = 64;
   std::size_t time_blocks = 1;
-  std::size_t correlation_lags = 32;
-  std::size_t subspace_rank = 512;
+  std::size_t correlation_lags = 24;
+  std::size_t subspace_rank = 1024;
   std::size_t panel_size = 1;
-  std::size_t mgs_passes = 2;
+  std::size_t mgs_passes = 1;
   std::size_t oversubscribe = 1;
   std::size_t theory_devices = 4;
   Mode mode = Mode::Full;
@@ -166,14 +169,17 @@ inline void print_help(const char *program, bool celerity_options,
   std::cout
       << "RFI subspace-extraction miniapp\n"
       << "Usage: " << program << " [options]\n"
-      << "  --antennas <int>             Array channels/features (default 768)\n"
+      << "  --granularity <tile|stage|partitioned> (default stage)\n"
+      << "  --partitions <int>           Correlation row blocks (default 4)\n"
+      << "  --metrics-prefix <path>      CSV output prefix (default rfi)\n"
+      << "  --antennas <int>             Array channels/features (default 4096)\n"
       << "  --snapshots <int>            Samples per frequency band (default 2048)\n"
-      << "  --bands <int>                Independent frequency bands (default 8)\n"
+      << "  --bands <int>                Independent frequency bands (default 64)\n"
       << "  --time-blocks <int>          Independent observation blocks (default 1)\n"
-      << "  --correlation-lags <int>     Circular lags per pair (default 32)\n"
-      << "  --rank <int>                 Extracted subspace rows (default 512)\n"
+      << "  --correlation-lags <int>     Circular lags per pair (default 24)\n"
+      << "  --rank <int>                 Extracted subspace rows (default 1024)\n"
       << "  --panel <int>                Reverse blocked-MGS panel (default 1)\n"
-      << "  --mgs-passes <int>           Reorthogonalization passes (default 2)\n"
+      << "  --mgs-passes <int>           Reorthogonalization passes (default 1)\n"
       << "  --gs-layout <row|column>     Basis-vector orientation (default row)\n"
       << "  --gs-kernel <blocked|classic> Fused panel or 3-stage MGS"
          " (default blocked)\n"
@@ -185,7 +191,7 @@ inline void print_help(const char *program, bool celerity_options,
       << "  --theory-devices <int>       Coarse-chunk report width (default 4)\n"
       << "  --verify <0|1>               Validate device summaries (default 1)\n"
       << "  --verify-full <0|1>          Materialize and validate full bases\n"
-      << "  --print-manifest <0|1>       Print every submitted kernel\n";
+      << "  --print-manifest <0|1>       Print every application task\n";
   if (celerity_options) {
     std::cout
         << "  --oversubscribe <int>        Celerity chunks/device hint (default "
@@ -213,7 +219,15 @@ inline Config parse_config(int argc, char **argv, bool celerity_options,
     }
     const std::string value = argv[++index];
     bool parsed = false;
-    if (option == "--antennas") {
+    if (option == "--granularity") {
+      parsed = value == "tile" || value == "stage" || value == "partitioned";
+      config.granularity = value;
+    } else if (option == "--partitions") {
+      parsed = parse_size(value, config.partitions) && config.partitions > 0;
+    } else if (option == "--metrics-prefix") {
+      config.metrics_prefix = value;
+      parsed = !value.empty();
+    } else if (option == "--antennas") {
       parsed = parse_size(value, config.antennas);
     } else if (option == "--snapshots") {
       parsed = parse_size(value, config.snapshots);
@@ -561,7 +575,11 @@ theoretical_chunk_work(const Config &config) {
 inline void print_configuration(const Config &config, const char *runtime,
                                 const char *mapper_mode) {
   const std::size_t tiles = tile_count(config);
-  const std::size_t per_tile = kernels_per_tile(config);
+  const bool partitioned = config.granularity == "partitioned" &&
+      config.mode != Mode::OrthogonalizeOnly;
+  const std::size_t per_tile = kernels_per_tile(config) +
+      (partitioned ? config.partitions - 1 : 0);
+  const std::size_t tasks_per_tile = config.granularity == "tile" ? 1 : per_tile;
   std::size_t total_kernels = 0;
   std::size_t total_bytes = 0;
   if (!checked_mul(per_tile, tiles, total_kernels) ||
@@ -606,10 +624,13 @@ inline void print_configuration(const Config &config, const char *runtime,
             << " verify_full=" << (config.verify_full ? 1 : 0)
             << " print_manifest=" << (config.print_manifest ? 1 : 0) << '\n';
   std::cout << "DAG tiles=" << tiles
-            << " submission_order=stage_major"
+            << " granularity=" << config.granularity
+            << " submission_order=" << (config.granularity == "tile" ? "tile_major" : "stage_major")
+            << " application_tasks_per_tile=" << tasks_per_tile
+            << " application_tasks=" << tasks_per_tile * tiles
             << " kernels_per_tile=" << per_tile
             << " total_kernels=" << total_kernels
-            << " max_width=" << tiles
+            << " independent_tiles=" << tiles
             << " mgs_panels_per_pass="
             << (config.mode == Mode::CorrelationOnly ||
                         config.gs_kernel == GsKernelStructure::Classic
@@ -682,7 +703,7 @@ inline void print_configuration(const Config &config, const char *runtime,
             << std::setprecision(6)
             << static_cast<double>(correlation_to_mgs_ratio)
             << " correlation_kernels_per_tile="
-            << (config.mode == Mode::OrthogonalizeOnly ? 0 : 1)
+            << (config.mode == Mode::OrthogonalizeOnly ? 0 : partitioned ? config.partitions : 1)
             << " mgs_kernels_per_tile="
             << mgs_kernels_per_tile(config)
             << '\n';

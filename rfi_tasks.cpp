@@ -1,7 +1,6 @@
 #include "rfi_starpu.hpp"
 
 #include <array>
-#include <atomic>
 #include <initializer_list>
 #include <string>
 
@@ -9,7 +8,7 @@ namespace rfi_starpu {
 namespace {
 constexpr auto stage_count = static_cast<std::size_t>(Stage::Count);
 std::array<starpu_codelet, stage_count> codelets{};
-std::array<std::atomic<std::size_t>, STARPU_NMAXWORKERS> worker_tasks{};
+std::array<starpu_perfmodel, stage_count> models{};
 
 KernelArgs kernel_args(const rfi::Config& config) {
   KernelArgs args{};
@@ -17,6 +16,12 @@ KernelArgs kernel_args(const rfi::Config& config) {
   args.snapshots = config.snapshots;
   args.correlation_lags = config.correlation_lags;
   args.rank = config.subspace_rank;
+  args.row_count = config.antennas;
+  args.panel_size = config.panel_size;
+  args.mgs_passes = config.mgs_passes;
+  args.pair_parallel = config.correlation_layout == rfi::CorrelationLayout::PairParallel;
+  args.classic = config.gs_kernel == rfi::GsKernelStructure::Classic;
+  args.compact = config.compact_gs;
   args.folded = config.correlation_order == rfi::CorrelationOrder::Folded;
   args.column_vectors = config.gs_layout == rfi::GsLayout::ColumnVectors;
   args.has_correlation = config.mode != rfi::Mode::OrthogonalizeOnly;
@@ -28,6 +33,35 @@ starpu_codelet& codelet(Stage stage) {
   return codelets[static_cast<std::size_t>(stage)];
 }
 
+std::uint32_t model_footprint(starpu_task* task) {
+  KernelArgs a;
+  starpu_codelet_unpack_args(task->cl_arg, &a);
+  std::uint32_t hash = 2166136261u;
+  // Hash semantic fields, excluding the pass number and struct padding.
+  const std::uint64_t fields[] = {a.antennas, a.snapshots, a.correlation_lags,
+      a.rank, a.panel_begin, a.panel_end, a.execution_rows, a.row_begin,
+      a.row_count, a.panel_size, a.mgs_passes, a.pair_parallel, a.classic,
+      a.compact, a.folded, a.column_vectors, a.has_correlation,
+      a.check_orthogonality};
+  for (auto field : fields) {
+    for (unsigned byte = 0; byte < 8; ++byte) {
+      hash = (hash ^ static_cast<std::uint8_t>(field)) * 16777619u;
+      field >>= 8;
+    }
+  }
+  return hash;
+}
+
+template <typename... Bindings>
+int submit_tracked(TileBuffers& tile, Stage stage, const KernelArgs& args,
+                   Bindings... bindings) {
+  auto* task = starpu_task_build(&codelet(stage), bindings...,
+                               STARPU_VALUE, &args, sizeof(args), 0);
+  if (!task) throw std::runtime_error("create StarPU task");
+  track_task(task, tile.tile_id, stage, args);
+  return starpu_task_submit(task);
+}
+
 void define_codelet(Stage stage, const char* name,
                     std::initializer_list<starpu_data_access_mode> modes) {
   auto& cl = codelet(stage);
@@ -35,9 +69,14 @@ void define_codelet(Stage stage, const char* name,
   cl.where = STARPU_CUDA;
   cl.cuda_funcs[0] = cuda_function(stage);
   cl.cuda_flags[0] = STARPU_CUDA_ASYNC;
-  cl.nbuffers = static_cast<int>(modes.size());
+  cl.nbuffers = modes.size() ? static_cast<int>(modes.size()) : STARPU_VARIABLE_NBUFFERS;
   std::copy(modes.begin(), modes.end(), cl.modes);
   cl.name = name;
+  auto& model = models[static_cast<std::size_t>(stage)];
+  model.type = STARPU_HISTORY_BASED;
+  model.symbol = name;
+  model.footprint = model_footprint;
+  cl.model = &model;
 }
 
 template <typename T>
@@ -87,44 +126,26 @@ void check_starpu(int status, const char* operation) {
 }
 
 void initialize_codelets() {
-  define_codelet(Stage::Mean, "rfi_mean", {STARPU_R, STARPU_W});
-  define_codelet(Stage::Stddev, "rfi_stddev", {STARPU_R, STARPU_R, STARPU_W});
-  define_codelet(Stage::Normalize, "rfi_normalize", {STARPU_RW, STARPU_R, STARPU_R});
-  define_codelet(Stage::RowCorrelation, "rfi_correlation_row",
+  define_codelet(Stage::Mean, "rfi_mean_v2", {STARPU_R, STARPU_W});
+  define_codelet(Stage::Stddev, "rfi_stddev_v2", {STARPU_R, STARPU_R, STARPU_W});
+  define_codelet(Stage::Normalize, "rfi_normalize_v2", {STARPU_RW, STARPU_R, STARPU_R});
+  define_codelet(Stage::RowCorrelation, "rfi_correlation_row_v2",
                  {STARPU_R, STARPU_R, STARPU_W, STARPU_W});
-  define_codelet(Stage::PairCorrelation, "rfi_correlation_pair",
+  define_codelet(Stage::PairCorrelation, "rfi_correlation_pair_v2",
                  {STARPU_R, STARPU_R, STARPU_W, STARPU_W});
-  define_codelet(Stage::CorrelationSummary, "rfi_correlation_summary", {STARPU_R, STARPU_W});
-  define_codelet(Stage::ReverseNorm, "rfi_reverse_norm", {STARPU_R, STARPU_W});
-  define_codelet(Stage::ReverseNormalize, "rfi_reverse_normalize", {STARPU_RW, STARPU_R});
-  define_codelet(Stage::ReversePanel, "rfi_reverse_panel", {STARPU_RW});
-  define_codelet(Stage::ReverseUpdate, "rfi_reverse_update", {STARPU_RW});
-  define_codelet(Stage::FinalSummary, "rfi_final_summary", {STARPU_R, STARPU_R, STARPU_W});
-}
-
-void record_cuda_task() {
-  const int worker = starpu_worker_get_id();
-  if (worker >= 0 && worker < STARPU_NMAXWORKERS) {
-    worker_tasks[worker].fetch_add(1, std::memory_order_relaxed);
-  }
-}
-
-void print_worker_stats() {
-  std::size_t total = 0, used = 0;
-  for (unsigned worker = 0; worker < starpu_worker_get_count(); ++worker) {
-    if (starpu_worker_get_type(worker) != STARPU_CUDA_WORKER) continue;
-    const auto tasks = worker_tasks[worker].load(std::memory_order_relaxed);
-    total += tasks;
-    used += tasks != 0;
-    std::cout << "WORKER id=" << worker
-              << " cuda_device=" << starpu_worker_get_devid(worker)
-              << " tasks=" << tasks << '\n';
-  }
-  std::cout << "EXECUTION completed_tasks=" << total
-            << " used_cuda_workers=" << used << '\n';
+  define_codelet(Stage::CorrelationSummary, "rfi_correlation_summary_v2", {STARPU_R, STARPU_W});
+  define_codelet(Stage::ReverseNorm, "rfi_reverse_norm_v2", {STARPU_R, STARPU_W});
+  define_codelet(Stage::ReverseNormalize, "rfi_reverse_normalize_v2", {STARPU_RW, STARPU_R});
+  define_codelet(Stage::ReversePanel, "rfi_reverse_panel_v2", {STARPU_RW});
+  define_codelet(Stage::ReverseUpdate, "rfi_reverse_update_v2", {STARPU_RW});
+  define_codelet(Stage::FinalSummary, "rfi_final_summary_v2", {STARPU_R, STARPU_R, STARPU_W});
+  define_codelet(Stage::Tile, "rfi_tile_v2", {});
 }
 
 void validate_starpu_config(const rfi::Config& config) {
+  if (config.granularity == "partitioned" && config.partitions > config.antennas) {
+    throw std::invalid_argument("--partitions must be <= --antennas");
+  }
   if (config.antennas > std::numeric_limits<std::uint32_t>::max()) {
     throw std::invalid_argument("--antennas exceeds StarPU's matrix/vector dimensions");
   }
@@ -150,10 +171,23 @@ TileBuffers::TileBuffers(std::size_t tile, const rfi::Config& config)
   register_vector(correlation_rows, correlation_rows_host, "correlation_rows");
   register_vector(summary, summary_host, "summary");
   register_vector(mgs_norm, mgs_norm_host, "mgs_norm");
+  if (config.granularity == "partitioned" &&
+      config.mode != rfi::Mode::OrthogonalizeOnly) {
+    starpu_data_filter filter{};
+    filter.filter_func = starpu_matrix_filter_vertical_block;
+    filter.nchildren = static_cast<unsigned>(config.partitions);
+    basis_parts.resize(config.partitions);
+    snapshot_parts.resize(config.partitions);
+    starpu_data_partition_plan(basis, &filter, basis_parts.data());
+    starpu_data_partition_plan(correlation_snapshot, &filter, snapshot_parts.data());
+  }
 }
 
 TileBuffers::~TileBuffers() {
-  // Release handles after read_results acquires the outputs.
+  if (!basis_parts.empty()) {
+    starpu_data_partition_clean(basis, basis_parts.size(), basis_parts.data());
+    starpu_data_partition_clean(correlation_snapshot, snapshot_parts.size(), snapshot_parts.data());
+  }
   for (auto handle : {data, mean, stddev, basis, correlation_snapshot,
                       lag_offsets, correlation_rows, summary, mgs_norm}) {
     if (handle) starpu_data_unregister_no_coherency(handle);
@@ -192,10 +226,9 @@ void submit_mean(TileBuffers &tile,
                   range_1d(antennas), float_bytes(samples),
                   float_bytes(antennas));
   auto args = kernel_args(config);
-  check_starpu(starpu_task_insert(&codelet(Stage::Mean),
+  check_starpu(submit_tracked(tile, Stage::Mean, args,
       STARPU_R, tile.data,
-      STARPU_W, tile.mean,
-      STARPU_VALUE, &args, sizeof(args), 0), "submit mean");
+      STARPU_W, tile.mean), "submit mean");
 }
 
 void submit_stddev(TileBuffers &tile,
@@ -209,11 +242,10 @@ void submit_stddev(TileBuffers &tile,
                   float_bytes(samples + antennas),
                   float_bytes(antennas));
   auto args = kernel_args(config);
-  check_starpu(starpu_task_insert(&codelet(Stage::Stddev),
+  check_starpu(submit_tracked(tile, Stage::Stddev, args,
       STARPU_R, tile.data,
       STARPU_R, tile.mean,
-      STARPU_W, tile.stddev,
-      STARPU_VALUE, &args, sizeof(args), 0), "submit stddev");
+      STARPU_W, tile.stddev), "submit stddev");
 }
 
 void submit_normalize(TileBuffers &tile,
@@ -227,11 +259,10 @@ void submit_normalize(TileBuffers &tile,
                   float_bytes(samples + 2 * antennas),
                   float_bytes(samples));
   auto args = kernel_args(config);
-  check_starpu(starpu_task_insert(&codelet(Stage::Normalize),
+  check_starpu(submit_tracked(tile, Stage::Normalize, args,
       STARPU_RW, tile.data,
       STARPU_R, tile.mean,
-      STARPU_R, tile.stddev,
-      STARPU_VALUE, &args, sizeof(args), 0), "submit normalize");
+      STARPU_R, tile.stddev), "submit normalize");
 }
 
 void submit_row_correlation(TileBuffers &tile,
@@ -248,12 +279,11 @@ void submit_row_correlation(TileBuffers &tile,
                   float_bytes(static_cast<rfi::work_count>(2) * antennas *
                               antennas));
   auto args = kernel_args(config);
-  check_starpu(starpu_task_insert(&codelet(Stage::RowCorrelation),
+  check_starpu(submit_tracked(tile, Stage::RowCorrelation, args,
       STARPU_R, tile.data,
       STARPU_R, tile.lag_offsets,
       STARPU_W, tile.basis,
-      STARPU_W, tile.correlation_snapshot,
-      STARPU_VALUE, &args, sizeof(args), 0), "submit row_correlation");
+      STARPU_W, tile.correlation_snapshot), "submit row_correlation");
 }
 
 void submit_pair_correlation(TileBuffers &tile,
@@ -270,12 +300,11 @@ void submit_pair_correlation(TileBuffers &tile,
                   float_bytes(static_cast<rfi::work_count>(2) * antennas *
                               antennas));
   auto args = kernel_args(config);
-  check_starpu(starpu_task_insert(&codelet(Stage::PairCorrelation),
+  check_starpu(submit_tracked(tile, Stage::PairCorrelation, args,
       STARPU_R, tile.data,
       STARPU_R, tile.lag_offsets,
       STARPU_W, tile.basis,
-      STARPU_W, tile.correlation_snapshot,
-      STARPU_VALUE, &args, sizeof(args), 0), "submit pair_correlation");
+      STARPU_W, tile.correlation_snapshot), "submit pair_correlation");
 }
 
 void submit_correlation_summary(TileBuffers &tile,
@@ -289,10 +318,9 @@ void submit_correlation_summary(TileBuffers &tile,
                   static_cast<rfi::work_count>(antennas) *
                       sizeof(rfi::CorrelationRowSummary));
   auto args = kernel_args(config);
-  check_starpu(starpu_task_insert(&codelet(Stage::CorrelationSummary),
+  check_starpu(submit_tracked(tile, Stage::CorrelationSummary, args,
       STARPU_R, tile.correlation_snapshot,
-      STARPU_W, tile.correlation_rows,
-      STARPU_VALUE, &args, sizeof(args), 0), "submit correlation_summary");
+      STARPU_W, tile.correlation_rows), "submit correlation_summary");
 }
 
 void submit_reverse_norm(TileBuffers &tile,
@@ -304,11 +332,11 @@ void submit_reverse_norm(TileBuffers &tile,
                   pivot + 1, pivot, range_1d(1), float_bytes(antennas),
                   sizeof(float), mgs_pass);
   auto args = kernel_args(config);
+  args.mgs_pass = mgs_pass;
   args.panel_begin = pivot;
-  check_starpu(starpu_task_insert(&codelet(Stage::ReverseNorm),
+  check_starpu(submit_tracked(tile, Stage::ReverseNorm, args,
       STARPU_R, tile.basis,
-      STARPU_W, tile.mgs_norm,
-      STARPU_VALUE, &args, sizeof(args), 0), "submit reverse_norm");
+      STARPU_W, tile.mgs_norm), "submit reverse_norm");
 }
 
 void submit_reverse_normalize(TileBuffers &tile,
@@ -321,11 +349,11 @@ void submit_reverse_normalize(TileBuffers &tile,
                   float_bytes(antennas) + sizeof(float),
                   float_bytes(antennas), mgs_pass);
   auto args = kernel_args(config);
+  args.mgs_pass = mgs_pass;
   args.panel_begin = pivot;
-  check_starpu(starpu_task_insert(&codelet(Stage::ReverseNormalize),
+  check_starpu(submit_tracked(tile, Stage::ReverseNormalize, args,
       STARPU_RW, tile.basis,
-      STARPU_R, tile.mgs_norm,
-      STARPU_VALUE, &args, sizeof(args), 0), "submit reverse_normalize");
+      STARPU_R, tile.mgs_norm), "submit reverse_normalize");
 }
 
 void submit_reverse_panel(TileBuffers &tile,
@@ -342,11 +370,11 @@ void submit_reverse_panel(TileBuffers &tile,
                   range_1d(local_size), float_bytes(panel_values),
                   float_bytes(panel_values), mgs_pass);
   auto args = kernel_args(config);
+  args.mgs_pass = mgs_pass;
   args.panel_begin = panel_begin;
   args.panel_end = panel_end;
-  check_starpu(starpu_task_insert(&codelet(Stage::ReversePanel),
-      STARPU_RW, tile.basis,
-      STARPU_VALUE, &args, sizeof(args), 0), "submit reverse_panel");
+  check_starpu(submit_tracked(tile, Stage::ReversePanel, args,
+      STARPU_RW, tile.basis), "submit reverse_panel");
 }
 
 void submit_reverse_update(TileBuffers &tile,
@@ -374,12 +402,12 @@ void submit_reverse_update(TileBuffers &tile,
                   float_bytes(target_values + panel_values),
                   float_bytes(target_values), mgs_pass);
   auto args = kernel_args(config);
+  args.mgs_pass = mgs_pass;
   args.panel_begin = panel_begin;
   args.panel_end = panel_end;
   args.execution_rows = execution_rows;
-  check_starpu(starpu_task_insert(&codelet(Stage::ReverseUpdate),
-      STARPU_RW, tile.basis,
-      STARPU_VALUE, &args, sizeof(args), 0), "submit reverse_update");
+  check_starpu(submit_tracked(tile, Stage::ReverseUpdate, args,
+      STARPU_RW, tile.basis), "submit reverse_update");
 }
 
 void submit_final_summary(TileBuffers &tile,
@@ -393,17 +421,66 @@ void submit_final_summary(TileBuffers &tile,
               sizeof(rfi::CorrelationRowSummary),
       sizeof(rfi::TileSummary));
   auto args = kernel_args(config);
-  check_starpu(starpu_task_insert(&codelet(Stage::FinalSummary),
+  check_starpu(submit_tracked(tile, Stage::FinalSummary, args,
       STARPU_R, tile.basis,
       STARPU_R, tile.correlation_rows,
-      STARPU_W, tile.summary,
-      STARPU_VALUE, &args, sizeof(args), 0), "submit final_summary");
+      STARPU_W, tile.summary), "submit final_summary");
+}
+
+void submit_partitioned_correlation(TileBuffers& tile, const rfi::Config& config,
+                                    rfi::Manifest& manifest) {
+  const auto parts = static_cast<unsigned>(tile.basis_parts.size());
+  starpu_data_partition_submit(tile.basis, parts, tile.basis_parts.data());
+  starpu_data_partition_submit(tile.correlation_snapshot, parts, tile.snapshot_parts.data());
+  std::size_t begin = 0;
+  for (unsigned part = 0; part < parts; ++part) {
+    auto args = kernel_args(config);
+    args.row_begin = begin;
+    args.row_count = starpu_matrix_get_ny(tile.basis_parts[part]);
+    const auto stage = args.pair_parallel ? Stage::PairCorrelation : Stage::RowCorrelation;
+    manifest.record(config, tile.tile_id, "correlation_partition", begin,
+                    begin + args.row_count, 0,
+                    range_2d(args.row_count, config.antennas),
+                    float_bytes(config.antennas * config.snapshots),
+                    float_bytes(2 * args.row_count * config.antennas));
+    check_starpu(submit_tracked(tile, stage, args,
+        STARPU_R, tile.data, STARPU_R, tile.lag_offsets,
+        STARPU_W, tile.basis_parts[part], STARPU_W, tile.snapshot_parts[part]),
+        "submit correlation partition");
+    begin += args.row_count;
+  }
+  // The explicit CPU gather is part of this variant's measured communication.
+  starpu_data_unpartition_submit(tile.basis, parts, tile.basis_parts.data(), STARPU_MAIN_RAM);
+  starpu_data_unpartition_submit(tile.correlation_snapshot, parts, tile.snapshot_parts.data(), STARPU_MAIN_RAM);
+}
+
+void submit_tile(TileBuffers& tile, const rfi::Config& config, rfi::Manifest& manifest) {
+  auto args = kernel_args(config);
+  manifest.record(config, tile.tile_id, "tile", 0, 0, 0, "whole_tile", 0, 0);
+  starpu_data_descr buffers[] = {
+      {tile.data, args.has_correlation ? STARPU_RW : STARPU_R},
+      {tile.mean, STARPU_W}, {tile.stddev, STARPU_W},
+      {tile.basis, args.has_correlation ? STARPU_W : STARPU_RW},
+      {tile.correlation_snapshot, STARPU_W}, {tile.lag_offsets, STARPU_R},
+      {tile.correlation_rows, args.has_correlation ? STARPU_W : STARPU_R},
+      {tile.summary, STARPU_W}, {tile.mgs_norm, STARPU_W}};
+  check_starpu(submit_tracked(tile, Stage::Tile, args,
+      STARPU_DATA_MODE_ARRAY, buffers, 9), "submit tile");
+}
+
+std::size_t expected_tasks(const rfi::Config& config) {
+  if (config.granularity == "tile") return rfi::tile_count(config);
+  const auto extra = config.granularity == "partitioned" &&
+      config.mode != rfi::Mode::OrthogonalizeOnly ? config.partitions - 1 : 0;
+  return rfi::tile_count(config) * (rfi::kernels_per_tile(config) + extra);
 }
 
 void submit_correlation(TileBuffers &tile,
                         const rfi::Config &config,
                         rfi::Manifest &manifest) {
-  if (config.correlation_layout == rfi::CorrelationLayout::PairParallel) {
+  if (config.granularity == "partitioned") {
+    submit_partitioned_correlation(tile, config, manifest);
+  } else if (config.correlation_layout == rfi::CorrelationLayout::PairParallel) {
     submit_pair_correlation(tile, config, manifest);
   } else {
     submit_row_correlation(tile, config, manifest);
@@ -412,6 +489,10 @@ void submit_correlation(TileBuffers &tile,
 
 void submit_batch(std::vector<std::unique_ptr<TileBuffers>> &tiles,
                   const rfi::Config &config, rfi::Manifest &manifest) {
+  if (config.granularity == "tile") {
+    for (auto& tile : tiles) submit_tile(*tile, config, manifest);
+    return;
+  }
   if (config.mode != rfi::Mode::OrthogonalizeOnly) {
     for (auto &tile : tiles) {
       submit_mean(*tile, config, manifest);

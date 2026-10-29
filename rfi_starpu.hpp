@@ -7,7 +7,15 @@
 namespace rfi_starpu {
 namespace rfi = rfi_subspace_extraction;
 void initialize_codelets();
-void print_worker_stats();
+void configure_scheduler(starpu_conf& conf);
+void begin_measurement();
+void end_execution();
+void end_measurement();
+void track_task(starpu_task* task, std::size_t tile, Stage stage, const KernelArgs& args);
+void write_metrics(const rfi::Config& config, double runtime_init, double data_init,
+                   double run, double result, double e2e, double total);
+std::size_t expected_tasks(const rfi::Config& config);
+const char* stage_name(Stage stage);
 void check_starpu(int status, const char* operation);
 
 struct TileBuffers {
@@ -21,6 +29,8 @@ struct TileBuffers {
   starpu_data_handle_t data{}, mean{}, stddev{}, basis{};
   starpu_data_handle_t correlation_snapshot{}, lag_offsets{}, correlation_rows{};
   starpu_data_handle_t summary{}, mgs_norm{};
+
+  std::vector<starpu_data_handle_t> basis_parts, snapshot_parts;
 
   TileBuffers(std::size_t tile, const rfi::Config& config);
   ~TileBuffers();

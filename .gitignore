@@ -1,3 +1,6 @@
 /build/
 /logs/
 /.starpu/
+
+/rfi_*.csv
+/__pycache__/
