@@ -1,73 +1,38 @@
 #pragma once
 
 // Computation bodies ported from rfi_subspace_extraction_sycl_timer.cpp.
-#include "../test-scenario/rfi_subspace_extraction_common.hpp"
-
-#ifdef __CUDACC__
-#define RFI_HD __host__ __device__
-#define RFI_COMPUTE __device__
-#else
-#define RFI_HD
-#define RFI_COMPUTE
-#endif
+#include "rfi_codelets.hpp"
+#include <cmath>
 
 namespace rfi_starpu {
 namespace rfi = rfi_subspace_extraction;
 
-struct KernelArgs {
-  std::size_t antennas, snapshots, correlation_lags, rank;
-  std::size_t panel_begin = 0, panel_end = 0, execution_rows = 0;
-  bool folded, column_vectors, has_correlation, check_orthogonality;
-};
-static_assert(std::is_trivially_copyable_v<KernelArgs>);
-
-inline KernelArgs kernel_args(const rfi::Config& config) {
-  KernelArgs args{};
-  args.antennas = config.antennas;
-  args.snapshots = config.snapshots;
-  args.correlation_lags = config.correlation_lags;
-  args.rank = config.subspace_rank;
-  args.folded = config.correlation_order == rfi::CorrelationOrder::Folded;
-  args.column_vectors = config.gs_layout == rfi::GsLayout::ColumnVectors;
-  args.has_correlation = config.mode != rfi::Mode::OrthogonalizeOnly;
-  args.check_orthogonality = config.mode != rfi::Mode::CorrelationOnly;
-  return args;
-}
-
 struct Index {
   std::size_t row, col = 0;
-  RFI_HD std::size_t operator[](unsigned axis) const { return axis ? col : row; }
+  __host__ __device__ std::size_t operator[](unsigned axis) const { return axis ? col : row; }
 };
 
 struct Matrix {
   float* ptr;
   std::size_t ld;
-  RFI_HD float& operator[](Index index) const {
+  __host__ __device__ float& operator[](Index index) const {
     return ptr[index.row * ld + index.col];
   }
 };
 
-RFI_COMPUTE inline bool finite(double value) {
-#ifdef __CUDA_ARCH__
+__device__ inline bool finite(double value) {
   return isfinite(value);
-#else
-  return std::isfinite(value);
-#endif
 }
 
-RFI_COMPUTE inline float inverse_sqrt(float value) {
-#ifdef __CUDA_ARCH__
+__device__ inline float inverse_sqrt(float value) {
   return rsqrtf(value);
-#else
-  return 1.0f / sqrtf(value);
-#endif
 }
 
-inline constexpr std::size_t panel_threads = 128;
+constexpr std::size_t panel_threads = 128;
 
-RFI_COMPUTE inline void mean_item(
+__device__ inline void mean_item(
     Matrix data, float* mean,
-    [[maybe_unused]] const KernelArgs& args, [[maybe_unused]] Index item) {
+    const KernelArgs& args, Index item) {
   const auto snapshots = args.snapshots;
   const std::size_t antenna = item[0];
   float sum = 0.0f;
@@ -77,9 +42,9 @@ RFI_COMPUTE inline void mean_item(
   mean[antenna] = sum / static_cast<float>(snapshots);
 }
 
-RFI_COMPUTE inline void stddev_item(
+__device__ inline void stddev_item(
     Matrix data, const float* mean, float* stddev,
-    [[maybe_unused]] const KernelArgs& args, [[maybe_unused]] Index item) {
+    const KernelArgs& args, Index item) {
   const auto snapshots = args.snapshots;
   const std::size_t antenna = item[0];
   float sum = 0.0f;
@@ -91,16 +56,16 @@ RFI_COMPUTE inline void stddev_item(
   stddev[antenna] = sqrtf(fmaxf(variance, 1.0e-12f));
 }
 
-RFI_COMPUTE inline void normalize_item(
+__device__ inline void normalize_item(
     Matrix data, const float* mean, const float* stddev,
-    [[maybe_unused]] const KernelArgs& args, [[maybe_unused]] Index item) {
+    const KernelArgs& args, Index item) {
   const std::size_t antenna = item[0];
   data[item] = (data[item] - mean[antenna]) / stddev[antenna];
 }
 
-RFI_COMPUTE inline void row_correlation_item(
+__device__ inline void row_correlation_item(
     Matrix data, const std::uint32_t* lag_offsets, Matrix basis, Matrix correlation_snapshot,
-    [[maybe_unused]] const KernelArgs& args, [[maybe_unused]] Index item) {
+    const KernelArgs& args, Index item) {
   const auto antennas = args.antennas;
   const auto snapshots = args.snapshots;
   const auto correlation_lags = args.correlation_lags;
@@ -142,9 +107,9 @@ RFI_COMPUTE inline void row_correlation_item(
   }
 }
 
-RFI_COMPUTE inline void pair_correlation_item(
+__device__ inline void pair_correlation_item(
     Matrix data, const std::uint32_t* lag_offsets, Matrix basis, Matrix correlation_snapshot,
-    [[maybe_unused]] const KernelArgs& args, [[maybe_unused]] Index item) {
+    const KernelArgs& args, Index item) {
   const auto antennas = args.antennas;
   const auto snapshots = args.snapshots;
   const auto correlation_lags = args.correlation_lags;
@@ -185,9 +150,9 @@ RFI_COMPUTE inline void pair_correlation_item(
   correlation_snapshot[item] = correlation;
 }
 
-RFI_COMPUTE inline void correlation_summary_item(
+__device__ inline void correlation_summary_item(
     Matrix correlation_snapshot, rfi::CorrelationRowSummary* rows,
-    [[maybe_unused]] const KernelArgs& args, [[maybe_unused]] Index item) {
+    const KernelArgs& args, Index item) {
   const auto antennas = args.antennas;
   const auto folded = args.folded;
   const std::size_t work_row = item[0];
@@ -235,9 +200,9 @@ RFI_COMPUTE inline void correlation_summary_item(
   rows[work_row] = output;
 }
 
-RFI_COMPUTE inline void reverse_norm_item(
+__device__ inline void reverse_norm_item(
     Matrix basis, float* norm,
-    [[maybe_unused]] const KernelArgs& args, [[maybe_unused]] Index item) {
+    const KernelArgs& args, Index item) {
   const auto antennas = args.antennas;
   const auto column_vectors = args.column_vectors;
   const auto pivot = args.panel_begin;
@@ -252,9 +217,9 @@ RFI_COMPUTE inline void reverse_norm_item(
       sqrtf(fmaxf(norm_squared, 1.0e-20f));
 }
 
-RFI_COMPUTE inline void reverse_normalize_item(
+__device__ inline void reverse_normalize_item(
     Matrix basis, const float* norm,
-    [[maybe_unused]] const KernelArgs& args, [[maybe_unused]] Index item) {
+    const KernelArgs& args, Index item) {
   const auto column_vectors = args.column_vectors;
   const auto pivot = args.panel_begin;
   const std::size_t element = item[0];
@@ -266,9 +231,9 @@ RFI_COMPUTE inline void reverse_normalize_item(
 }
 
 template <typename Team>
-RFI_COMPUTE inline void reverse_panel_item(
+__device__ inline void reverse_panel_item(
     Matrix basis, float* scratch,
-    [[maybe_unused]] const KernelArgs& args, Team item) {
+    const KernelArgs& args, Team item) {
   const auto antennas = args.antennas;
   const auto column_vectors = args.column_vectors;
   const auto panel_begin = args.panel_begin;
@@ -339,9 +304,9 @@ RFI_COMPUTE inline void reverse_panel_item(
   }
 }
 
-RFI_COMPUTE inline void reverse_update_item(
+__device__ inline void reverse_update_item(
     Matrix basis,
-    [[maybe_unused]] const KernelArgs& args, [[maybe_unused]] Index item) {
+    const KernelArgs& args, Index item) {
   const auto antennas = args.antennas;
   const auto column_vectors = args.column_vectors;
   const auto panel_begin = args.panel_begin;
@@ -370,9 +335,9 @@ RFI_COMPUTE inline void reverse_update_item(
   }
 }
 
-RFI_COMPUTE inline void final_summary_item(
+__device__ inline void final_summary_item(
     Matrix basis, const rfi::CorrelationRowSummary* correlation_rows, rfi::TileSummary* summary,
-    [[maybe_unused]] const KernelArgs& args, [[maybe_unused]] Index item) {
+    const KernelArgs& args, Index item) {
   const auto antennas = args.antennas;
   const auto rank = args.rank;
   const auto has_correlation = args.has_correlation;
@@ -481,5 +446,3 @@ RFI_COMPUTE inline void final_summary_item(
 
 } // namespace rfi_starpu
 
-#undef RFI_HD
-#undef RFI_COMPUTE

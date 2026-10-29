@@ -1,27 +1,11 @@
 #pragma once
 #include <starpu.h>
+#include "rfi_codelets.hpp"
 #include "../test-scenario/rfi_subspace_extraction_common.hpp"
 #include <memory>
 
 namespace rfi_starpu {
 namespace rfi = rfi_subspace_extraction;
-enum class Stage {
-  Mean,
-  Stddev,
-  Normalize,
-  RowCorrelation,
-  PairCorrelation,
-  CorrelationSummary,
-  ReverseNorm,
-  ReverseNormalize,
-  ReversePanel,
-  ReverseUpdate,
-  FinalSummary,
-  Count
-};
-using CudaFunction = void (*)(void*[], void*);
-CudaFunction cuda_function(Stage stage);
-void record_cuda_task();
 void initialize_codelets();
 void print_worker_stats();
 void check_starpu(int status, const char* operation);

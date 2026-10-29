@@ -1,5 +1,4 @@
 #include "rfi_starpu.hpp"
-#include "rfi_kernels.hpp"
 
 #include <array>
 #include <atomic>
@@ -11,6 +10,19 @@ namespace {
 constexpr auto stage_count = static_cast<std::size_t>(Stage::Count);
 std::array<starpu_codelet, stage_count> codelets{};
 std::array<std::atomic<std::size_t>, STARPU_NMAXWORKERS> worker_tasks{};
+
+KernelArgs kernel_args(const rfi::Config& config) {
+  KernelArgs args{};
+  args.antennas = config.antennas;
+  args.snapshots = config.snapshots;
+  args.correlation_lags = config.correlation_lags;
+  args.rank = config.subspace_rank;
+  args.folded = config.correlation_order == rfi::CorrelationOrder::Folded;
+  args.column_vectors = config.gs_layout == rfi::GsLayout::ColumnVectors;
+  args.has_correlation = config.mode != rfi::Mode::OrthogonalizeOnly;
+  args.check_orthogonality = config.mode != rfi::Mode::CorrelationOnly;
+  return args;
+}
 
 starpu_codelet& codelet(Stage stage) {
   return codelets[static_cast<std::size_t>(stage)];

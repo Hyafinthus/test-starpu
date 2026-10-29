@@ -8,7 +8,9 @@ cd starpu
 bash build.sh
 ```
 
-构建使用 `nvcc` 和 `starpu-1.4`，默认目标架构为 A6000 的 `sm_86`，生成 `build/rfi_subspace_extraction_starpu`。
+构建使用 C++14：`g++` 编译宿主代码，`nvcc` 编译 CUDA kernel 并链接 `starpu-1.4`，生成 `build/rfi_subspace_extraction_starpu`。
+
+默认适配 CUDA 10.1，生成 `compute_75` PTX，由 NVIDIA 驱动在 A6000 上 JIT 编译。使用 CUDA 11.1 及以上时，可执行 `CUDA_ARCH=86 bash build.sh` 生成 A6000 的原生 `sm_86` 代码。
 
 四卡运行：
 

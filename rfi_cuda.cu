@@ -1,6 +1,8 @@
 #include <cuda_runtime.h>
 #include <starpu_cuda.h>
-#include "rfi_starpu.hpp"
+#include <starpu.h>
+#include <algorithm>
+#include "rfi_codelets.hpp"
 #include "rfi_kernels.hpp"
 
 namespace rfi_starpu {
@@ -210,7 +212,7 @@ CudaFunction cuda_function(Stage stage) {
       final_summary_cuda,
   };
   static_assert(sizeof(functions) / sizeof(functions[0]) ==
-                static_cast<std::size_t>(Stage::Count));
+                static_cast<std::size_t>(Stage::Count), "CUDA codelet count");
   return functions[static_cast<std::size_t>(stage)];
 }
 } // namespace rfi_starpu
